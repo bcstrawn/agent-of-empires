@@ -4,22 +4,58 @@
 use crate::acp::state::RateLimitInfo;
 use std::collections::HashMap;
 
+/// The one `codexErrorInfo` codex-acp raises as a prompt error for a spent
+/// usage window. Every other variant (`rateLimitExceeded`, `serverOverloaded`,
+/// the `httpStatusCode` objects) ends the turn as agent text, never as an
+/// error envelope, so anything else reaching this function is an ordinary error.
+const CODEX_USAGE_LIMIT_ERROR: &str = "usageLimitExceeded";
+
 /// Classify a structured prompt error as a rate limit. Reset time comes only
 /// from a separately captured rejected-window epoch; localized message text is
-/// displayed verbatim but never parsed or guessed.
+/// displayed as sent (codex's is trimmed) but never parsed or guessed.
+///
+/// Two adapter shapes report the same condition. `claude-agent-acp` tags the
+/// error `errorKind: "rate_limit"`; `codex-acp` raises a bare JSON-RPC
+/// internal error whose `data` carries codex's typed `codexErrorInfo`. Both
+/// yield `kind == "rate_limit"`, which is what the park/auto-resume path and
+/// the session banner key on.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<RateLimitInfo> {
     let data = err.data.as_ref()?;
-    let kind = data.get("errorKind").and_then(|v| v.as_str())?;
-    if kind != "rate_limit" {
+    if data.get("errorKind").and_then(|v| v.as_str()) == Some("rate_limit") {
+        return Some(RateLimitInfo {
+            status: err.message.clone(),
+            resets_at: captured_resets_at,
+            kind: "rate_limit".to_string(),
+        });
+    }
+    classify_codex_rate_limit_error(err, data, captured_resets_at)
+}
+
+/// Codex's shape of the same rejection. `codex-acp` builds the error with
+/// `RequestError.internalError(data)`, so `err.message` is the constant
+/// "Internal error" and codex's own sentence is in `data.message`, trimmed
+/// and never parsed, as the claude path treats `err.message`.
+fn classify_codex_rate_limit_error(
+    err: &agent_client_protocol::Error,
+    data: &serde_json::Value,
+    captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<RateLimitInfo> {
+    if data.get("codexErrorInfo")?.as_str()? != CODEX_USAGE_LIMIT_ERROR {
         return None;
     }
+    let status = data
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map_or_else(|| err.message.clone(), str::to_string);
     Some(RateLimitInfo {
-        status: err.message.clone(),
+        status,
         resets_at: captured_resets_at,
-        kind: kind.to_string(),
+        kind: "rate_limit".to_string(),
     })
 }
 
@@ -171,6 +207,103 @@ mod tests {
 
         let err = agent_client_protocol::Error::invalid_params();
         assert!(classify_rate_limit_error(&err, None).is_none());
+    }
+
+    // codex-acp reports a spent usage window as a JSON-RPC internal error
+    // carrying codex's typed `codexErrorInfo` and no `errorKind`; the sentence
+    // a reader needs is in `data.message`, the outer message is generic.
+    #[test]
+    fn classify_rate_limit_recognises_codex_usage_limit() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.data = Some(serde_json::json!({
+            "message": "You've hit your usage limit. Try again later.",
+            "codexErrorInfo": "usageLimitExceeded",
+        }));
+        let info = classify_rate_limit_error(&err, None).expect("classified");
+        assert_eq!(info.kind, "rate_limit");
+        assert_eq!(info.status, "You've hit your usage limit. Try again later.");
+        // Codex attributes no reset to the rejection; an unknown reset stays
+        // unknown and the reconciler uses its unknown-reset retry interval.
+        assert_eq!(info.resets_at, None);
+    }
+
+    #[test]
+    fn classify_rate_limit_codex_uses_captured_resets_at() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.data = Some(serde_json::json!({
+            "message": "You've hit your usage limit.",
+            "codexErrorInfo": "usageLimitExceeded",
+        }));
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
+        assert_eq!(info.resets_at, Some(captured));
+    }
+
+    // Without `data.message` there is nothing better than the outer message,
+    // and a blank one must not blank the banner.
+    #[test]
+    fn classify_rate_limit_codex_trims_the_sentence() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.data = Some(serde_json::json!({
+            "message": "  You've hit your usage limit.\n",
+            "codexErrorInfo": "usageLimitExceeded",
+        }));
+        let info = classify_rate_limit_error(&err, None).expect("classified");
+        assert_eq!(info.status, "You've hit your usage limit.");
+    }
+
+    #[test]
+    fn classify_rate_limit_codex_falls_back_to_the_outer_message() {
+        for data in [
+            serde_json::json!({ "codexErrorInfo": "usageLimitExceeded" }),
+            serde_json::json!({ "message": "   ", "codexErrorInfo": "usageLimitExceeded" }),
+        ] {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.message = "Internal error: usage limit".into();
+            err.data = Some(data);
+            let info = classify_rate_limit_error(&err, None).expect("classified");
+            assert_eq!(info.status, "Internal error: usage limit");
+        }
+    }
+
+    // Over-matching parks a session on a limit it is not under. Every other
+    // `CodexErrorInfo` variant, as generated for codex 0.155 (codex-acp
+    // `src/app-server/v2/CodexErrorInfo.ts`), must stay an ordinary error:
+    // `rateLimitExceeded` is a retried stream throttle codex-acp never raises
+    // as an error, and the object variants are transport or turn-state
+    // failures, not usage windows.
+    #[test]
+    fn classify_rate_limit_ignores_codex_errors_that_are_not_spent_windows() {
+        let cases = [
+            serde_json::json!("contextWindowExceeded"),
+            serde_json::json!("sessionBudgetExceeded"),
+            serde_json::json!("rateLimitExceeded"),
+            serde_json::json!("serverOverloaded"),
+            serde_json::json!("cyberPolicy"),
+            serde_json::json!("misalignmentPolicyViolation"),
+            serde_json::json!("internalServerError"),
+            serde_json::json!("unauthorized"),
+            serde_json::json!("badRequest"),
+            serde_json::json!("threadRollbackFailed"),
+            serde_json::json!("sandboxError"),
+            serde_json::json!("other"),
+            serde_json::json!({ "httpConnectionFailed": { "httpStatusCode": 429 } }),
+            serde_json::json!({ "responseStreamConnectionFailed": { "httpStatusCode": 429 } }),
+            serde_json::json!({ "responseStreamDisconnected": { "httpStatusCode": 429 } }),
+            serde_json::json!({ "responseTooManyFailedAttempts": { "httpStatusCode": 429 } }),
+            serde_json::json!({ "activeTurnNotSteerable": { "turnKind": "review" } }),
+        ];
+        for codex_error in cases {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.data = Some(serde_json::json!({
+                "message": "something went wrong",
+                "codexErrorInfo": codex_error,
+            }));
+            assert!(
+                classify_rate_limit_error(&err, None).is_none(),
+                "{codex_error} must not park the session"
+            );
+        }
     }
 
     #[test]
